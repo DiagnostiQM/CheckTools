@@ -1,0 +1,1 @@
+php C:\Tareas\ctrl_local_check.php
