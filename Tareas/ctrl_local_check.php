@@ -8,7 +8,7 @@ $con->beginTransaction();
 $conLocal->beginTransaction();
 
 $sqlMovimientos = "SELECT *, to_char(hora_marcada,'dd/mm/yyyy') hora_marcada_formateada FROM entradas_salidas
-			WHERE hora_marcada::date > (now()::Date - CAST('7 days' AS INTERVAL))
+			WHERE hora_marcada::date > (now()::Date - CAST('21 days' AS INTERVAL))
 			and estatus = 'PENDIENTE'
 			ORDER BY hora_marcada asc";
 $prMov = $conLocal->prepare($sqlMovimientos);
