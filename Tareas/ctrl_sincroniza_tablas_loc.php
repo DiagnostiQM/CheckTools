@@ -264,6 +264,13 @@ foreach ($prvVC as $cve_vc => $val_vc){
 	}
 }
 
+$sqlCodigo = "select * from origenes";
+$prvCodigo = $conLocal->prepare($sqlCodigo);
+$prvCodigo->execute();
+$datCodigo = $prvCodigo->fetch(PDO::FETCH_ASSOC);
+
+notifica_sincronizacion($con,$datCodigo['origen']);
+
 function vDt($pdato){
 	$dtFinal = "";
 	if(empty($pdato)){
@@ -272,6 +279,27 @@ function vDt($pdato){
 		$dtFinal = " '".$pdato."' ";
 	}
 	return $dtFinal;
+}
+
+function notifica_sincronizacion($con,$origen){
+	$existeOrigen = "select count(*) existe from check_activos WHERE nombre_origen = '".$origen."'";
+	$prEx = $con->prepare($existeOrigen);
+	$prEx->execute();
+	$rwEx = $prEx->fetch(PDO::FETCH_ASSOC);
+
+	if($rwEx['existe'] != '0'){
+		$actualizaOrigen = "update check_activos set 
+							fecha_actualizacion_general = now() 
+							where nombre_origen = '".$origen."' ";
+		$prAc = $con->prepare($actualizaOrigen);
+		$prAc->execute();
+	} else {
+		$insertaOrigen = "	insert into check_activos 
+							(nombre_origen,fecha_actualizacion_general) 
+							values ('".$origen."',now())";
+		$prIn = $con->prepare($insertaOrigen);
+		$prIn->execute();
+	}
 }
 
 $con->commit();
