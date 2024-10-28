@@ -1,5 +1,24 @@
 # CheckTools
-Herramientas para check 2.0
+--- Actualizacion Checkdqm 2.5 ---
+1.- Ejecutar el siguiente script en la BD del checkdqm mediante la herramienta pgAdmin:
+
+CREATE TABLE vacaciones_solicitudes (
+  cve_vacacion_solicitud numeric(10,0) NOT NULL,
+  folio_solicitud varchar(20),
+  estatus_solicitud varchar(40),
+  cve_personal numeric(10,0) NOT NULL,
+  CONSTRAINT "PK109" PRIMARY KEY ("cve_vacacion_solicitud")
+);
+
+2.- Remplazar el nombre del archivo ejecutable "jar" en el equipo destino por el nombre de "Huellas_BCK.jar" en caso de que tenga ya instalado previamente el Checkdqm
+3.- Pegar los archivos contenidos en la carpeta https://github.com/DiagnostiQM/CheckTools/tree/main/APP, en la carpeta destino del equipo donde se ejecuta el anterior Checkdqm
+4.- Eso serian todo los paso para actualizar el Checkdqm.
+5.- Ahora ya es posible modificar la zona horaria del check cuando se desactualiza la hora.
+6.- Presionar la combinacion de tecla Ctrl + Q
+7.- Mostrara una nueva ventana donde se puede indicar la Zona horario que tiene actualmente configurada, elegir la Zona horaria que cumpla con la hora adecuada.
+8.- Se cerrara el Checkdqm, ejecutar de nuevo para visualizar el cambio de horario.
+
+--- Herramientas para check 2.0 ---
 
 Los archivos y aplicaciones están probados para nuevas instalaciones, para la instalación de mejoras o actualizaciones se subirá en un release y dentro del release se explicara como se instala esa nueva actualización.
 
