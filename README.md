@@ -1,5 +1,6 @@
 # CheckTools
 --- Actualizacion Checkdqm 2.5 ---
+
 1.- Ejecutar el siguiente script en la BD del checkdqm mediante la herramienta pgAdmin:
 
 CREATE TABLE vacaciones_solicitudes (
