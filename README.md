@@ -12,11 +12,17 @@ CREATE TABLE vacaciones_solicitudes (
 );
 
 2.- Remplazar el nombre del archivo ejecutable "jar" en el equipo destino por el nombre de "Huellas_BCK.jar" en caso de que tenga ya instalado previamente el Checkdqm
+
 3.- Pegar los archivos contenidos en la carpeta https://github.com/DiagnostiQM/CheckTools/tree/main/APP, en la carpeta destino del equipo donde se ejecuta el anterior Checkdqm
+
 4.- Eso serian todo los paso para actualizar el Checkdqm.
+
 5.- Ahora ya es posible modificar la zona horaria del check cuando se desactualiza la hora.
+
 6.- Presionar la combinacion de tecla Ctrl + Q
+
 7.- Mostrara una nueva ventana donde se puede indicar la Zona horario que tiene actualmente configurada, elegir la Zona horaria que cumpla con la hora adecuada.
+
 8.- Se cerrara el Checkdqm, ejecutar de nuevo para visualizar el cambio de horario.
 
 --- Herramientas para check 2.0 ---
