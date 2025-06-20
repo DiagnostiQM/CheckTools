@@ -3,8 +3,8 @@ Class Conexion extends PDO
 {    
     private $dbname      = 'checkdqm'; 
     private $host        = 'sysdqm.com'; 
-    private $usuario     = 'ticdqmdb';
-    private $contrasenia = 't1cDQM#1';
+    private $usuario     = 'sysdqm';
+    private $contrasenia = 't1cDQM#3';
     private $puerto      = 5432;
     private $dbh;
     private $dbname_local      = 'checkdqm';
