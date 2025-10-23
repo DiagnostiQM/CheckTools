@@ -141,8 +141,7 @@ $prvDL = $con->prepare($sqlDL);
 $prvDL->execute();
 
 foreach ($prvDL as $cve_dl => $val_dl){
-
-	$sqlExiste = "SELECT count(*) total FROM dias_laborables WHERE cve_dia_laborable = ".vDt($val_dl['cve_dia_laborable'])." ";
+	$sqlExiste = "SELECT count(*) total, horario_entrada, horario_salida FROM dias_laborables WHERE cve_dia_laborable = ".vDt($val_dl['cve_dia_laborable'])." GROUP BY horario_entrada, horario_salida ";
 	$prExiste = $conLocal->prepare($sqlExiste);
 	$prExiste->execute();
     $datExiste = $prExiste->fetch(PDO::FETCH_ASSOC);
@@ -159,7 +158,14 @@ foreach ($prvDL as $cve_dl => $val_dl){
 						vDt($val_dl['fin_descanso']).", ".vDt($val_dl['tiempo_descanso']).")";
 		$prDinamicoDL = $conLocal->prepare($sqlDinamico);
 		$prDinamicoDL->execute();
-    }
+    } else if($datExiste['horario_entrada'] != $val_dl['horario_entrada'] || $datExiste['horario_salida'] != $val_dl['horario_salida'] ){
+        $sqlDinamico = 	" update dias_laborables set ".
+						" horario_entrada = ".vDt($val_dl['horario_entrada']).", ". 
+						" horario_salida = ".vDt($val_dl['horario_salida'])." ".
+						" where cve_dia_laborable = ".vDt($val_dl['cve_dia_laborable'])." ";
+		$prDinamicoDL = $conLocal->prepare($sqlDinamico);
+		$prDinamicoDL->execute();
+	}
 }
 
 $sqlPT = "select * from personal_turnos";
@@ -318,4 +324,5 @@ function notifica_sincronizacion($con,$origen){
 
 $con->commit();
 $conLocal->commit();
+
 ?>
