@@ -1,8 +1,10 @@
 <?php
 include_once 'conexion.php';
+$conObj = new Conexion();
+
 $conLocal = $conObj->conectar_local();
 $conLocal->beginTransaction();
-
+/*
 $sqlSincroniza = "select * from ejecutar_actualizacion where ejecutar_actualizacion = true";
 $prSincroniza = $conLocal->prepare($sqlSincroniza);
 $sin = $prSincroniza->execute();
@@ -12,8 +14,7 @@ if($datSin['ejecutar_actualizacion'] !== true || empty($datSin['ejecutar_actuali
 	$conLocal->rollBack();
 	exit();
 }
-
-$conObj = new Conexion();
+*/
 $con = $conObj->conectar();
 $con->beginTransaction();
 
@@ -327,4 +328,5 @@ $con->commit();
 $conLocal->commit();
 
 ?>
+
 
