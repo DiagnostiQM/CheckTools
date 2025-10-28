@@ -287,11 +287,11 @@ $prvCodigo = $conLocal->prepare($sqlCodigo);
 $prvCodigo->execute();
 $datCodigo = $prvCodigo->fetch(PDO::FETCH_ASSOC);
 notifica_sincronizacion($con,$datCodigo['origen']);
-
+/*
 $sqFinSin = "UPDATE ejecutar_actualizacion set fecha_peticion = now(), ejecutar_actualizacion = true ";
 $prFinSin = $conLocal->prepare($sqFinSin);
 $prFinSin->execute();
-
+*/
 
 function vDt($pdato){
 	$dtFinal = "";
@@ -328,5 +328,6 @@ $con->commit();
 $conLocal->commit();
 
 ?>
+
 
 
