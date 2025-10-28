@@ -57,7 +57,8 @@ foreach ($prvPR as $cve_pr => $val_pr){
 						" estatus_registro = ".vDt($val_pr['estatus_registro']).", ".
 						" nss = ".vDt($val_pr['nss']).", ".
 						" num_empleado = ".vDt($val_pr['num_empleado']).", ".
-						" clave_acceso = ".vDt($val_pr['clave_acceso'])." ".
+						" clave_acceso = ".vDt($val_pr['clave_acceso']).", ".
+						" estatus_personal = ".vDt($val_pr['estatus_personal'])." ".
 						" WHERE cve_personal =".vDt($val_pr['cve_personal'])." ";
     }
 	$prDinamicoPR = $conLocal->prepare($sqlDinamico);
@@ -326,3 +327,4 @@ $con->commit();
 $conLocal->commit();
 
 ?>
+
