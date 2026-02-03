@@ -148,7 +148,7 @@ foreach ($prvDL as $cve_dl => $val_dl){
 	$prExiste->execute();
     $datExiste = $prExiste->fetch(PDO::FETCH_ASSOC);
 
-    if($datExiste['total'] == '0'){
+    if(!$datExiste){
         $sqlDinamico = 	" INSERT INTO dias_laborables(
 						cve_dia_laborable, desc_dia_laborable, cve_turno, fecha_registro, creado_por, 
 						ip_registro, fecha_modificacion, modificado_por, ip_modifico, estatus_registro, 
@@ -160,7 +160,8 @@ foreach ($prvDL as $cve_dl => $val_dl){
 						vDt($val_dl['fin_descanso']).", ".vDt($val_dl['tiempo_descanso']).")";
 		$prDinamicoDL = $conLocal->prepare($sqlDinamico);
 		$prDinamicoDL->execute();
-    } else if($datExiste['horario_entrada'] != $val_dl['horario_entrada'] || $datExiste['horario_salida'] != $val_dl['horario_salida'] ){
+    } 
+	if($datExiste['horario_entrada'] != $val_dl['horario_entrada'] || $datExiste['horario_salida'] != $val_dl['horario_salida'] ){
         $sqlDinamico = 	" update dias_laborables set ".
 						" horario_entrada = ".vDt($val_dl['horario_entrada']).", ". 
 						" horario_salida = ".vDt($val_dl['horario_salida'])." ".
@@ -328,6 +329,7 @@ $con->commit();
 $conLocal->commit();
 
 ?>
+
 
 
 
