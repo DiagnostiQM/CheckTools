@@ -83,14 +83,20 @@ $prvHL->bindColumn('cve_huella', $cve_huella, PDO::PARAM_INT);
 $prvHL->bindColumn('cve_personal', $cve_personal, PDO::PARAM_INT);
 $prvHL->bindColumn('desc_huella', $fileData, PDO::PARAM_STR);
 
-$sqlHD = "delete from huellas";
-$prvHD = $conLocal->prepare($sqlHD);
-$prvHD->execute();
+$idsOrigen = [];
 
 while($prvHL->fetch(\PDO::FETCH_BOUND)){
 
+	$idsOrigen[] = $cve_huella;
+
 	$buffer = pg_escape_bytea($fileData);
-	$sqlDinamico = 	" INSERT INTO huellas (cve_huella, cve_personal, desc_huella ) values ($cve_huella,$cve_personal,'$buffer')";
+	$sqlDinamico = "
+		INSERT INTO huellas (cve_huella, cve_personal, desc_huella)
+		SELECT $cve_huella,$cve_personal,'".$buffer."'
+		WHERE NOT EXISTS (
+			SELECT 1 FROM huellas WHERE cve_huella = $cve_huella
+		)
+		";
 	$prDinamicoHL = $conLocal->prepare($sqlDinamico);
 	$o = $prDinamicoHL->execute();
 	
@@ -104,6 +110,13 @@ while($prvHL->fetch(\PDO::FETCH_BOUND)){
 	exit();
 	}
 
+}
+
+if(count($idsOrigen) > 0){
+    $ids = implode(",", $idsOrigen);
+    $sqlHD = "DELETE FROM huellas WHERE cve_huella NOT IN ($ids)";
+    $prvHD = $conLocal->prepare($sqlHD);
+    $prvHD->execute();
 }
 
 $sqlTN = "select * from turnos";
