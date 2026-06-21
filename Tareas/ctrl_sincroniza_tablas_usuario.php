@@ -174,10 +174,11 @@ foreach ($prvDL as $cve_dl => $val_dl){
 		$prDinamicoDL = $conLocal->prepare($sqlDinamico);
 		$prDinamicoDL->execute();
     } 
-	if($datExiste['horario_entrada'] != $val_dl['horario_entrada'] || $datExiste['horario_salida'] != $val_dl['horario_salida'] ){
+	if($datExiste['horario_entrada'] != $val_dl['horario_entrada'] || $datExiste['horario_salida'] != $val_dl['horario_salida'] || $val_dl['dia_labor'] != $datExiste['dia_labor']){
         $sqlDinamico = 	" update dias_laborables set ".
 						" horario_entrada = ".vDt($val_dl['horario_entrada']).", ". 
-						" horario_salida = ".vDt($val_dl['horario_salida'])." ".
+						" horario_salida = ".vDt($val_dl['horario_salida']).", ".
+						" dia_labor = ".vDt($val_dl['dia_labor'])." ".
 						" where cve_dia_laborable = ".vDt($val_dl['cve_dia_laborable'])." ";
 		$prDinamicoDL = $conLocal->prepare($sqlDinamico);
 		$prDinamicoDL->execute();
