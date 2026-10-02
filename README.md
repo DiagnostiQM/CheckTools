@@ -1,3 +1,7 @@
+# Después de instalar la bd ejecutar el siguiente script
+
+SELECT setval('"public"."seq_entrada_salida"', 1100000, true);
+
 # CheckTools
 --- Actualizacion Checkdqm 2.5 ---
 
