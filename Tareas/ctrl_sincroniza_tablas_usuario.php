@@ -156,7 +156,7 @@ $prvDL = $con->prepare($sqlDL);
 $prvDL->execute();
 
 foreach ($prvDL as $cve_dl => $val_dl){
-	$sqlExiste = "SELECT count(*) total, horario_entrada, horario_salida FROM dias_laborables WHERE cve_dia_laborable = ".vDt($val_dl['cve_dia_laborable'])." GROUP BY horario_entrada, horario_salida ";
+	$sqlExiste = "SELECT count(*) total, horario_entrada, horario_salida, dia_labor FROM dias_laborables WHERE cve_dia_laborable = ".vDt($val_dl['cve_dia_laborable'])." GROUP BY horario_entrada, horario_salida, dia_labor ";
 	$prExiste = $conLocal->prepare($sqlExiste);
 	$prExiste->execute();
     $datExiste = $prExiste->fetch(PDO::FETCH_ASSOC);
