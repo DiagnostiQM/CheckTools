@@ -1,349 +1,359 @@
 <?php
+/**
+ * Sincronización servidor central (checkdqm @ sysdqm.com) -> base local del checador.
+ *
+ * Objetivo: NO bloquear tablas/filas locales mientras corre, para que un empleado
+ * que está checando (entrada/salida) no sea rechazado ni se quede esperando.
+ *
+ * Estrategia:
+ *  1. Se lee TODO el origen primero (lectura pura, sin bloquear nada) en una
+ *     sola "foto" consistente. La latencia de red ya no alarga ningún bloqueo local.
+ *  2. Se compara contra lo que ya hay en local (en PHP) y solo se escriben las filas
+ *     nuevas o que realmente cambiaron. Las filas sin cambios nunca se tocan ni se bloquean.
+ *  3. Las escrituras locales se aplican en transacciones cortas (lotes de TAM_LOTE),
+ *     con statement_timeout corto: si algo está ocupado, el sincronizador cede y reintenta,
+ *     en lugar de dejar al checador esperando detrás de él.
+ *  4. Un candado "advisory" evita que dos ejecuciones simultáneas (cron encimado)
+ *     compitan entre sí.
+ */
 include_once 'conexion.php';
-$conObj = new Conexion();
 
+const TAM_LOTE       = 200;      // operaciones por transacción local
+// PostgreSQL 9.2 no tiene lock_timeout. Como cada sentencia del sincronizador es de
+// UNA sola fila (tarda milisegundos), statement_timeout hace la misma función:
+// si una sentencia tarda más de esto es porque está esperando una fila ocupada,
+// se cancela (57014), se deshace el lote y se reintenta.
+const STMT_TIMEOUT   = '3s';
+const MAX_REINTENTOS = 3;
+const LLAVE_CANDADO  = 7310524;  // id del advisory lock (cualquier entero fijo)
+
+// Definición de tablas: columnas a copiar y columnas que se actualizan si ya existe la fila.
+// (Se respeta exactamente lo que hacía el script original.)
+$TABLAS = [
+    'personales' => [
+        'pk' => 'cve_personal',
+        'columnas' => ['cve_personal', 'nombre', 'paterno', 'materno', 'rfc', 'cve_subarea', 'fecha_registro', 'creado_por',
+                       'ip_registro', 'fecha_modificacion', 'modificado_por', 'ip_modifico', 'estatus_registro',
+                       'fecha_nacimiento', 'sexo', 'numero_oficina', 'correo_electronico', 'estatus_personal',
+                       'cve_puesto', 'cve_marca', 'nss', 'num_empleado', 'url_foto', 'cve_estado', 'cve_sucursal', 'clave_acceso'],
+        'actualizar' => ['estatus_registro', 'nss', 'num_empleado', 'clave_acceso', 'estatus_personal'],
+    ],
+    'turnos' => [
+        'pk' => 'cve_turno',
+        'columnas' => ['cve_turno', 'desc_turno', 'tipo_turno', 'fecha_registro', 'creado_por', 'ip_registro',
+                       'fecha_modificacion', 'modificado_por', 'ip_modifico', 'estatus_registro'],
+        'actualizar' => ['desc_turno', 'tipo_turno', 'fecha_registro', 'creado_por', 'ip_registro',
+                         'fecha_modificacion', 'modificado_por', 'ip_modifico', 'estatus_registro'],
+    ],
+    'dias_laborables' => [
+        'pk' => 'cve_dia_laborable',
+        'columnas' => ['cve_dia_laborable', 'desc_dia_laborable', 'cve_turno', 'fecha_registro', 'creado_por',
+                       'ip_registro', 'fecha_modificacion', 'modificado_por', 'ip_modifico', 'estatus_registro',
+                       'dia_labor', 'horario_entrada', 'horario_salida', 'tolerancia_entrada', 'inicio_descanso',
+                       'fin_descanso', 'tiempo_descanso'],
+        'actualizar' => ['horario_entrada', 'horario_salida', 'dia_labor'],
+    ],
+    'personal_turnos' => [
+        'pk' => 'cve_personal_turno',
+        'columnas' => ['cve_personal_turno', 'cve_turno', 'cve_personal', 'fecha_registro', 'creado_por', 'ip_registro',
+                       'fecha_modificacion', 'modificado_por', 'ip_modifico', 'estatus_registro', 'estatus_turno',
+                       'tiene_turno_temporal'],
+        'actualizar' => ['estatus_turno'],
+    ],
+    'notificaciones' => [
+        'pk' => 'cve_notificacion',
+        'columnas' => ['cve_notificacion', 'desc_notificacion', 'mostrar_notificacion', 'fecha_registro', 'creado_por',
+                       'ip_registro', 'fecha_modificacion', 'modificado_por', 'ip_modifico', 'estatus_registro'],
+        'actualizar' => ['desc_notificacion', 'mostrar_notificacion', 'fecha_registro', 'creado_por',
+                         'ip_registro', 'fecha_modificacion', 'modificado_por', 'ip_modifico', 'estatus_registro'],
+        'borrar_sobrantes' => true,   // antes: DELETE de todo + reinsertar
+    ],
+    'calendario_festivos' => [
+        'pk' => 'cve_calendario',
+        'columnas' => ['cve_calendario', 'anio', 'nota_festivo', 'fecha_registro', 'creado_por',
+                       'ip_registro', 'fecha_modificacion', 'modificado_por', 'ip_modifico',
+                       'estatus_registro', 'fecha_festivo_inicio', 'fecha_festivo_fin', 'fecha_festivo_fin_real'],
+        'actualizar' => [],           // solo inserta las nuevas
+    ],
+    'vacaciones' => [
+        'pk' => 'cve_vacacion',
+        'columnas' => ['cve_vacacion', 'estatus_vacaciones', 'fecha_inicio', 'fecha_final', 'cve_personal', 'fecha_registro',
+                       'creado_por', 'ip_registro', 'fecha_modificacion', 'modificado_por', 'ip_modifico', 'estatus_registro'],
+        'actualizar' => [],           // solo inserta las nuevas
+    ],
+];
+
+$MSJ_ERROR = "El proceso no se realiz&oacute; Reportar con su enlace administrativo. (sincronizado)";
+
+$conObj   = new Conexion();
+$con      = $conObj->conectar();
 $conLocal = $conObj->conectar_local();
-$conLocal->beginTransaction();
-/*
-$sqlSincroniza = "select * from ejecutar_actualizacion where ejecutar_actualizacion = true";
-$prSincroniza = $conLocal->prepare($sqlSincroniza);
-$sin = $prSincroniza->execute();
-$datSin = $prSincroniza->fetch(PDO::FETCH_ASSOC);
 
-if($datSin['ejecutar_actualizacion'] !== true || empty($datSin['ejecutar_actualizacion']) ){
-	$conLocal->rollBack();
-	exit();
+if (!$con || !$conLocal) {
+    echo $MSJ_ERROR;
+    exit(1);
 }
-*/
-$con = $conObj->conectar();
-$con->beginTransaction();
 
-$sqlPR = "select * from personales";
-$prvPR = $con->prepare($sqlPR);
-$prvPR->execute();
+foreach ([$con, $conLocal] as $pdo) {
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+}
 
-foreach ($prvPR as $cve_pr => $val_pr){
-
-	$sqlExiste = "SELECT count(*) total FROM personales WHERE cve_personal = ".vDt($val_pr['cve_personal'])." ";
-	$prExistePR = $conLocal->prepare($sqlExiste);
-	$n = $prExistePR->execute();
-    $datExiste = $prExistePR->fetch(PDO::FETCH_ASSOC);
-
-	if ( !$n ) {
-		$msjerror	= $prExistePR->errorInfo();
-		$con->rollBack();
-		$conLocal->rollBack();
-		echo $sqlExiste;
-		var_dump($msjerror);
-		echo "El proceso no se realiz&oacute; Reportar con su enlace administrativo. (sincronizado)";
-		exit();
-	}
-
-    if($datExiste['total'] == '0'){
-        $sqlDinamico = 	" INSERT INTO personales( ".
-						" cve_personal, nombre, paterno, materno, rfc, cve_subarea, fecha_registro, creado_por,  ".
-						" ip_registro, fecha_modificacion, modificado_por, ip_modifico, estatus_registro,  ".
-						" fecha_nacimiento, sexo, numero_oficina, correo_electronico, estatus_personal,  ".
-						" cve_puesto, cve_marca, nss, num_empleado, url_foto, cve_estado, cve_sucursal, clave_acceso)  ".
-						" VALUES  ".
-						" (".vDt($val_pr['cve_personal']).", ".vDt($val_pr['nombre']).", ".vDt($val_pr['paterno']).", ".vDt($val_pr['materno']).", ".
-						vDt($val_pr['rfc']).", ".vDt($val_pr['cve_subarea']).", ".vDt($val_pr['fecha_registro']).", ".vDt($val_pr['creado_por']).", ".
-						vDt($val_pr['ip_registro']).", ".vDt($val_pr['fecha_modificacion']).", ".vDt($val_pr['modificado_por']).", ".vDt($val_pr['ip_modifico']).", ".
-						vDt($val_pr['estatus_registro']).", ".vDt($val_pr['fecha_nacimiento']).", ".vDt($val_pr['sexo']).", ".vDt($val_pr['numero_oficina']).", ".
-						vDt($val_pr['correo_electronico']).", ".vDt($val_pr['estatus_personal']).", ".vDt($val_pr['cve_puesto']).", ".vDt($val_pr['cve_marca']).", ".
-						vDt($val_pr['nss']).", ".vDt($val_pr['num_empleado']).", ".vDt($val_pr['url_foto']).", ".vDt($val_pr['cve_estado']).", ".
-						vDt($val_pr['cve_sucursal']).", ".vDt($val_pr['clave_acceso']).")";
-    } else {
-        $sqlDinamico = 	" UPDATE personales set ".
-						" estatus_registro = ".vDt($val_pr['estatus_registro']).", ".
-						" nss = ".vDt($val_pr['nss']).", ".
-						" num_empleado = ".vDt($val_pr['num_empleado']).", ".
-						" clave_acceso = ".vDt($val_pr['clave_acceso']).", ".
-						" estatus_personal = ".vDt($val_pr['estatus_personal'])." ".
-						" WHERE cve_personal =".vDt($val_pr['cve_personal'])." ";
+try {
+    // Evita dos sincronizaciones al mismo tiempo (no bloquea ninguna tabla).
+    if (!$conLocal->query("SELECT pg_try_advisory_lock(" . LLAVE_CANDADO . ")")->fetchColumn()) {
+        echo "Ya hay una sincronizaci&oacute;n en curso; se omite esta ejecuci&oacute;n.";
+        exit(0);
     }
-	$prDinamicoPR = $conLocal->prepare($sqlDinamico);
-	$m = $prDinamicoPR->execute();
 
-	if ( !$m ) {
-		$msjerror	= $prDinamicoPR->errorInfo();
-		$con->rollBack();
-		$conLocal->rollBack();
-		echo $sqlDinamico;
-		var_dump($msjerror);
-		echo "El proceso no se realiz&oacute; Reportar con su enlace administrativo. (sincronizado)";
-		exit();
-	}
-}
-
-$sqlHL = "select * from huellas";
-$prvHL = $con->prepare($sqlHL);
-$prvHL->execute();
-$prvHL->bindColumn('cve_huella', $cve_huella, PDO::PARAM_INT);
-$prvHL->bindColumn('cve_personal', $cve_personal, PDO::PARAM_INT);
-$prvHL->bindColumn('desc_huella', $fileData, PDO::PARAM_STR);
-
-$idsOrigen = [];
-
-while($prvHL->fetch(\PDO::FETCH_BOUND)){
-
-	$idsOrigen[] = $cve_huella;
-
-	$buffer = pg_escape_bytea($fileData);
-	$sqlDinamico = "
-		INSERT INTO huellas (cve_huella, cve_personal, desc_huella)
-		SELECT $cve_huella,$cve_personal,'".$buffer."'
-		WHERE NOT EXISTS (
-			SELECT 1 FROM huellas WHERE cve_huella = $cve_huella
-		)
-		";
-	$prDinamicoHL = $conLocal->prepare($sqlDinamico);
-	$o = $prDinamicoHL->execute();
-	
-	if ( !$o ) {
-	$msjerror	= $prDinamicoHL->errorInfo();
-	$con->rollBack();
-	$conLocal->rollBack();
-	echo $sqlDinamico;
-	var_dump($msjerror);
-	echo "El proceso no se realiz&oacute; Reportar con su enlace administrativo. (sincronizado)";
-	exit();
-	}
-
-}
-
-if(count($idsOrigen) > 0){
-    $ids = implode(",", $idsOrigen);
-    $sqlHD = "DELETE FROM huellas WHERE cve_huella NOT IN ($ids)";
-    $prvHD = $conLocal->prepare($sqlHD);
-    $prvHD->execute();
-}
-
-$sqlTN = "select * from turnos";
-$prvTN = $con->prepare($sqlTN);
-$prvTN->execute();
-
-foreach ($prvTN as $cve_tn => $val_tn){
-
-	$sqlExiste = "SELECT count(*) total FROM turnos WHERE cve_turno = ".vDt($val_tn['cve_turno'])." ";
-	$prExiste = $conLocal->prepare($sqlExiste);
-	$prExiste->execute();
-    $datExiste = $prExiste->fetch(PDO::FETCH_ASSOC);
-
-    if($datExiste['total'] == '0'){
-        $sqlDinamico = 	" INSERT INTO turnos( ".
-						" cve_turno, desc_turno, tipo_turno, fecha_registro, creado_por, ip_registro,  ".
-						" fecha_modificacion, modificado_por, ip_modifico, estatus_registro)  ".
-						" VALUES ( ".
-						vDt($val_tn['cve_turno']).", ".vDt($val_tn['desc_turno']).", ".vDt($val_tn['tipo_turno']).", ".
-						vDt($val_tn['fecha_registro']).", ".vDt($val_tn['creado_por']).", ".vDt($val_tn['ip_registro']).", ".
-						vDt($val_tn['fecha_modificacion']).", ".vDt($val_tn['modificado_por']).", ".vDt($val_tn['ip_modifico']).", ".
-						vDt($val_tn['estatus_registro']).")";
-    } else {
-        $sqlDinamico = 	" UPDATE turnos SET 
-						desc_turno = ".vDt($val_tn['desc_turno']).", tipo_turno = ".vDt($val_tn['tipo_turno']).", 
-						fecha_registro = ".vDt($val_tn['fecha_registro']).", creado_por = ".vDt($val_tn['creado_por']).", 
-						ip_registro = ".vDt($val_tn['ip_registro']).", fecha_modificacion = ".vDt($val_tn['fecha_modificacion']).", 
-						modificado_por = ".vDt($val_tn['modificado_por']).", ip_modifico = ".vDt($val_tn['ip_modifico']).", 
-						estatus_registro = ".vDt($val_tn['estatus_registro'])." WHERE cve_turno = ".vDt($val_tn['cve_turno'])." ";
+    // ---------------------------------------------------------------
+    // 1. Leer el origen completo en una sola foto consistente (solo lectura).
+    // ---------------------------------------------------------------
+    $con->beginTransaction();
+    $con->exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    $origen = [];
+    foreach ($TABLAS as $tabla => $def) {
+        $origen[$tabla] = leerTabla($con, $tabla, $def['pk'], $def['columnas']);
     }
-	$prDinamicoTN = $conLocal->prepare($sqlDinamico);
-	$prDinamicoTN->execute();
-}
+    $idsHuellasOrigen = $con->query("SELECT cve_huella FROM huellas")->fetchAll(PDO::FETCH_COLUMN);
+    $con->commit();
 
-$sqlDL = "select * from dias_laborables";
-$prvDL = $con->prepare($sqlDL);
-$prvDL->execute();
-
-foreach ($prvDL as $cve_dl => $val_dl){
-	$sqlExiste = "SELECT count(*) total, horario_entrada, horario_salida, dia_labor FROM dias_laborables WHERE cve_dia_laborable = ".vDt($val_dl['cve_dia_laborable'])." GROUP BY horario_entrada, horario_salida, dia_labor ";
-	$prExiste = $conLocal->prepare($sqlExiste);
-	$prExiste->execute();
-    $datExiste = $prExiste->fetch(PDO::FETCH_ASSOC);
-
-    if(!$datExiste){
-        $sqlDinamico = 	" INSERT INTO dias_laborables(
-						cve_dia_laborable, desc_dia_laborable, cve_turno, fecha_registro, creado_por, 
-						ip_registro, fecha_modificacion, modificado_por, ip_modifico, estatus_registro, 
-						dia_labor, horario_entrada, horario_salida, tolerancia_entrada, inicio_descanso, 
-						fin_descanso, tiempo_descanso) VALUES (".
-						vDt($val_dl['cve_dia_laborable']).", ".vDt($val_dl['desc_dia_laborable']).", ".vDt($val_dl['cve_turno']).", ".vDt($val_dl['fecha_registro']).", ".vDt($val_dl['creado_por']).",".
-						vDt($val_dl['ip_registro']).", ".vDt($val_dl['fecha_modificacion']).", ".vDt($val_dl['modificado_por']).", ".vDt($val_dl['ip_modifico']).", ".vDt($val_dl['estatus_registro']).", ".
-						vDt($val_dl['dia_labor']).", ".vDt($val_dl['horario_entrada']).", ".vDt($val_dl['horario_salida']).", ".vDt($val_dl['tolerancia_entrada']).", ".vDt($val_dl['inicio_descanso']).", ".
-						vDt($val_dl['fin_descanso']).", ".vDt($val_dl['tiempo_descanso']).")";
-		$prDinamicoDL = $conLocal->prepare($sqlDinamico);
-		$prDinamicoDL->execute();
-    } 
-	if($datExiste['horario_entrada'] != $val_dl['horario_entrada'] || $datExiste['horario_salida'] != $val_dl['horario_salida'] || $val_dl['dia_labor'] != $datExiste['dia_labor']){
-        $sqlDinamico = 	" update dias_laborables set ".
-						" horario_entrada = ".vDt($val_dl['horario_entrada']).", ". 
-						" horario_salida = ".vDt($val_dl['horario_salida']).", ".
-						" dia_labor = ".vDt($val_dl['dia_labor'])." ".
-						" where cve_dia_laborable = ".vDt($val_dl['cve_dia_laborable'])." ";
-		$prDinamicoDL = $conLocal->prepare($sqlDinamico);
-		$prDinamicoDL->execute();
-	}
-}
-
-$sqlPT = "select * from personal_turnos";
-$prvPT = $con->prepare($sqlPT);
-$prvPT->execute();
-
-foreach ($prvPT as $cve_pt => $val_pt){
-
-	$sqlExistePT = "SELECT count(*) total FROM personal_turnos WHERE cve_personal_turno = ".vDt($val_pt['cve_personal_turno'])." ";
-	$prExistePT = $conLocal->prepare($sqlExistePT);
-	$x = $prExistePT->execute();
-    $datExistePT = $prExistePT->fetch(PDO::FETCH_ASSOC);
-
-	if ( !$x ) {
-		$msjerror	= $prExistePT->errorInfo();
-		$con->rollBack();
-		$conLocal->rollBack();
-		echo $sqlExistePT;
-		var_dump($msjerror);
-		echo "El proceso no se realiz&oacute; Reportar con su enlace administrativo. (sincronizado)";
-		exit();
-	}
-
-    if($datExistePT['total'] == '0'){
-        $sqlDinamico = 	" INSERT INTO personal_turnos ".
-						" (cve_personal_turno, cve_turno, cve_personal, fecha_registro, creado_por, ip_registro, fecha_modificacion, ".
-						" modificado_por, ip_modifico, estatus_registro, estatus_turno, tiene_turno_temporal) ".
-						" VALUES (".vDt($val_pt['cve_personal_turno']).", ".vDt($val_pt['cve_turno']).", ".vDt($val_pt['cve_personal']).", ".
-						vDt($val_pt['fecha_registro']).", ".vDt($val_pt['creado_por']).", ".vDt($val_pt['ip_registro']).", ".vDt($val_pt['fecha_modificacion']).", ".
-						vDt($val_pt['modificado_por']).", ".vDt($val_pt['ip_modifico']).", ".vDt($val_pt['estatus_registro']).", ".vDt($val_pt['estatus_turno']).", ".
-						vDt($val_pt['tiene_turno_temporal']).") ";
-    } else {
-        $sqlDinamico = " UPDATE personal_turnos set ".
-						" estatus_turno = '".$val_pt['estatus_turno']."' ".
-						" WHERE cve_personal_turno = ".$val_pt['cve_personal_turno'];
+    // ---------------------------------------------------------------
+    // 2. Aplicar en local, en el mismo orden que el original (respeta llaves foráneas).
+    // ---------------------------------------------------------------
+    $resumen = [];
+    $resumen['personales'] = sincronizarTabla($conLocal, 'personales', $TABLAS['personales'], $origen['personales']);
+    $resumen['huellas']    = sincronizarHuellas($con, $conLocal, $idsHuellasOrigen);
+    foreach (['turnos', 'dias_laborables', 'personal_turnos', 'notificaciones', 'calendario_festivos', 'vacaciones'] as $tabla) {
+        $resumen[$tabla] = sincronizarTabla($conLocal, $tabla, $TABLAS[$tabla], $origen[$tabla]);
     }
-	$prDinamicoPT = $conLocal->prepare($sqlDinamico);
-	$y = $prDinamicoPT->execute();
 
-	if ( !$y ) {
-		$msjerror	= $prDinamicoPT->errorInfo();
-		$con->rollBack();
-		$conLocal->rollBack();
-		echo $sqlDinamico;
-		var_dump($msjerror);
-		echo "El proceso no se realiz&oacute; Reportar con su enlace administrativo. (sincronizado)";
-		exit();
-	}
+    // ---------------------------------------------------------------
+    // 3. Avisar al servidor central (sentencia suelta, sin transacción larga).
+    // ---------------------------------------------------------------
+    $codigoOrigen = $conLocal->query("SELECT origen FROM origenes LIMIT 1")->fetchColumn();
+    if ($codigoOrigen !== false) {
+        notificaSincronizacion($con, $codigoOrigen);
+    }
+
+    $conLocal->query("SELECT pg_advisory_unlock(" . LLAVE_CANDADO . ")");
+
+    foreach ($resumen as $tabla => $r) {
+        echo "$tabla: {$r['insertados']} nuevos, {$r['actualizados']} actualizados, {$r['borrados']} borrados<br>\n";
+    }
+} catch (Exception $e) {
+    foreach ([$con, $conLocal] as $pdo) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+    }
+    echo htmlspecialchars($e->getMessage()) . "<br>\n";
+    echo $MSJ_ERROR;
+    exit(1);
 }
 
-$sqlNT = "select * from notificaciones";
-$prvNT = $con->prepare($sqlNT);
-$prvNT->execute();
+// =====================================================================
+// Funciones
+// =====================================================================
 
-$sqlND = "delete from notificaciones";
-$prvND = $conLocal->prepare($sqlND);
-$prvND->execute();
-
-foreach ($prvNT as $cve_nt => $val_nt){
-    $sqlDinamico = 	" INSERT INTO notificaciones ".
-					" (cve_notificacion, desc_notificacion, mostrar_notificacion, fecha_registro, creado_por,  ".
-					" ip_registro, fecha_modificacion, modificado_por, ip_modifico, estatus_registro)  ".
-					" VALUES (".vDt($val_nt['cve_notificacion']).", ".vDt($val_nt['desc_notificacion']).", ".vDt($val_nt['mostrar_notificacion']).", ".
-								vDt($val_nt['fecha_registro']).", ".vDt($val_nt['creado_por']).", ".vDt($val_nt['ip_registro']).", ".
-								vDt($val_nt['fecha_modificacion']).", ".vDt($val_nt['modificado_por']).", ".vDt($val_nt['ip_modifico']).", ".
-								vDt($val_nt['estatus_registro']).") ";
-	$prDinamicoNT = $conLocal->prepare($sqlDinamico);
-	$prDinamicoNT->execute();
+/**
+ * Normaliza un valor leído de PDO para poder compararlo y enviarlo como parámetro.
+ * - null      -> null
+ * - booleanos -> 't' / 'f'   (antes vDt() convertía false en NULL)
+ * - ''        -> null        (igual que hacía vDt())
+ * - 0 / '0'   -> '0'         (antes vDt() lo convertía en NULL, era un error)
+ */
+function normalizar($v)
+{
+    if ($v === null) {
+        return null;
+    }
+    if (is_bool($v)) {
+        return $v ? 't' : 'f';
+    }
+    if (is_resource($v)) {
+        return stream_get_contents($v);
+    }
+    $v = (string)$v;
+    return $v === '' ? null : $v;
 }
 
-$sqlDF = "select * from calendario_festivos";
-$prvDF = $con->prepare($sqlDF);
-$prvDF->execute();
-
-foreach ($prvDF as $cve_df => $val_df){
-	$sqlExisteDF = "SELECT count(*) total FROM calendario_festivos WHERE cve_calendario = ".vDt($val_df['cve_calendario'])." ";
-	$prExisteDF = $conLocal->prepare($sqlExisteDF);
-	$prExisteDF->execute();
-    $datExisteDF = $prExisteDF->fetch(PDO::FETCH_ASSOC);
-
-    if($datExisteDF['total'] == '0'){
-		$sqlDinamico = 	" INSERT INTO calendario_festivos(
-						cve_calendario, anio, nota_festivo, fecha_registro, creado_por, 
-						ip_registro, fecha_modificacion, modificado_por, ip_modifico, 
-						estatus_registro, fecha_festivo_inicio, fecha_festivo_fin, fecha_festivo_fin_real) VALUES (".
-						vDt($val_df['cve_calendario']).", ".vDt($val_df['anio']).", ".vDt($val_df['nota_festivo']).", ".vDt($val_df['fecha_registro']).", ".vDt($val_df['creado_por']).", ".
-						vDt($val_df['ip_registro']).", ".vDt($val_df['fecha_modificacion']).", ".vDt($val_df['modificado_por']).", ".vDt($val_df['ip_modifico']).", ".
-						vDt($val_df['estatus_registro']).", ".vDt($val_df['fecha_festivo_inicio']).", ".vDt($val_df['fecha_festivo_fin']).", ".vDt($val_df['fecha_festivo_fin_real']).") ";
-		$prDinamicoDF = $conLocal->prepare($sqlDinamico);
-		$prDinamicoDF->execute();
-	}
+/** Lee las columnas indicadas de una tabla, indexadas por su llave primaria. */
+function leerTabla(PDO $pdo, $tabla, $pk, array $columnas)
+{
+    $filas = [];
+    foreach ($pdo->query("SELECT " . implode(', ', $columnas) . " FROM $tabla") as $fila) {
+        $fila = array_map('normalizar', $fila);
+        $filas[(string)$fila[$pk]] = $fila;
+    }
+    return $filas;
 }
 
-$sqlVC = "select * from vacaciones";
-$prvVC = $con->prepare($sqlVC);
-$prvVC->execute();
+/**
+ * Compara origen vs local y escribe solo lo necesario:
+ * INSERT de filas nuevas, UPDATE de filas que cambiaron, DELETE de sobrantes (si aplica).
+ */
+function sincronizarTabla(PDO $local, $tabla, array $def, array $filasOrigen)
+{
+    $pk         = $def['pk'];
+    $columnas   = $def['columnas'];
+    $actualizar = $def['actualizar'];
 
-foreach ($prvVC as $cve_vc => $val_vc){
-	$sqlExisteDF = "SELECT count(*) total FROM vacaciones WHERE cve_vacacion = ".vDt($val_vc['cve_vacacion'])." ";
-	$prExisteDF = $conLocal->prepare($sqlExisteDF);
-	$prExisteDF->execute();
-    $datExisteDF = $prExisteDF->fetch(PDO::FETCH_ASSOC);
+    $colsLocal  = array_values(array_unique(array_merge([$pk], $actualizar)));
+    $filasLocal = leerTabla($local, $tabla, $pk, $colsLocal);
 
-    if($datExisteDF['total'] == '0'){
-		$sqlDinamico = 	" INSERT INTO vacaciones
-							(cve_vacacion, estatus_vacaciones, fecha_inicio, fecha_final, cve_personal, fecha_registro, 
-							 creado_por, ip_registro, fecha_modificacion, modificado_por, ip_modifico, estatus_registro) 
-						  VALUES ( ".vDt($val_vc['cve_vacacion']).", ".vDt($val_vc['estatus_vacaciones']).", ".vDt($val_vc['fecha_inicio']).", ".vDt($val_vc['fecha_final']).", ".vDt($val_vc['cve_personal']).", ".vDt($val_vc['fecha_registro']).", 
-							 ".vDt($val_vc['creado_por']).", ".vDt($val_vc['ip_registro']).", ".vDt($val_vc['fecha_modificacion']).", ".vDt($val_vc['modificado_por']).", ".vDt($val_vc['ip_modifico']).", ".vDt($val_vc['estatus_registro']).")";
-		$prDinamicoDF = $conLocal->prepare($sqlDinamico);
-		$prDinamicoDF->execute();
-	}
+    $sqlInsert = "INSERT INTO $tabla (" . implode(', ', $columnas) . ") VALUES ("
+               . implode(', ', array_fill(0, count($columnas), '?')) . ")";
+    $sqlUpdate = $actualizar
+        ? "UPDATE $tabla SET " . implode(', ', array_map(function ($c) { return "$c = ?"; }, $actualizar)) . " WHERE $pk = ?"
+        : null;
+    $sqlDelete = "DELETE FROM $tabla WHERE $pk = ?";
+
+    $ops = [];
+    $r = ['insertados' => 0, 'actualizados' => 0, 'borrados' => 0];
+
+    foreach ($filasOrigen as $id => $fila) {
+        if (!isset($filasLocal[$id])) {
+            $ops[] = [$sqlInsert, valores($fila, $columnas)];
+            $r['insertados']++;
+        } elseif ($sqlUpdate !== null) {
+            $actual = $filasLocal[$id];
+            foreach ($actualizar as $c) {
+                if ($actual[$c] !== $fila[$c]) {
+                    $params   = valores($fila, $actualizar);
+                    $params[] = $fila[$pk];
+                    $ops[]    = [$sqlUpdate, $params];
+                    $r['actualizados']++;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!empty($def['borrar_sobrantes'])) {
+        foreach (array_keys(array_diff_key($filasLocal, $filasOrigen)) as $id) {
+            $ops[] = [$sqlDelete, [$id]];
+            $r['borrados']++;
+        }
+    }
+
+    aplicarEnLotes($local, $ops);
+    return $r;
 }
 
-$sqlCodigo = "select * from origenes";
-$prvCodigo = $conLocal->prepare($sqlCodigo);
-$prvCodigo->execute();
-$datCodigo = $prvCodigo->fetch(PDO::FETCH_ASSOC);
-notifica_sincronizacion($con,$datCodigo['origen']);
-/*
-$sqFinSin = "UPDATE ejecutar_actualizacion set fecha_peticion = now(), ejecutar_actualizacion = true ";
-$prFinSin = $conLocal->prepare($sqFinSin);
-$prFinSin->execute();
-*/
+/**
+ * Huellas: solo se descargan del servidor las que faltan en local (antes se bajaban
+ * TODAS las huellas binarias en cada ejecución). Se insertan como binario real
+ * (PARAM_LOB), sin pg_escape_bytea ni SQL concatenado.
+ */
+function sincronizarHuellas(PDO $con, PDO $local, array $idsOrigen)
+{
+    $idsOrigen = array_map('strval', $idsOrigen);
+    $idsLocal  = array_map('strval', $local->query("SELECT cve_huella FROM huellas")->fetchAll(PDO::FETCH_COLUMN));
 
-function vDt($pdato){
-	$dtFinal = "";
-	if(empty($pdato)){
-		$dtFinal = " NULL ";
-	} else {
-		$dtFinal = " '".$pdato."' ";
-	}
-	return $dtFinal;
+    $nuevos    = array_values(array_diff($idsOrigen, $idsLocal));
+    // Igual que el original: solo se borra si el origen trajo huellas.
+    $sobrantes = count($idsOrigen) > 0 ? array_values(array_diff($idsLocal, $idsOrigen)) : [];
+
+    $r = ['insertados' => 0, 'actualizados' => 0, 'borrados' => 0];
+
+    $st = $con->prepare("SELECT cve_huella, cve_personal, desc_huella FROM huellas WHERE cve_huella = ANY(CAST(? AS bigint[]))");
+    foreach (array_chunk($nuevos, 50) as $grupo) {
+        $st->execute(['{' . implode(',', $grupo) . '}']);
+        $ops = [];
+        while ($f = $st->fetch(PDO::FETCH_ASSOC)) {
+            $blob  = is_resource($f['desc_huella']) ? stream_get_contents($f['desc_huella']) : $f['desc_huella'];
+            $ops[] = ["INSERT INTO huellas (cve_huella, cve_personal, desc_huella) VALUES (?, ?, ?)",
+                      [$f['cve_huella'], $f['cve_personal'], $blob],
+                      [2]];   // el parámetro 2 (base 0) va como binario
+        }
+        aplicarEnLotes($local, $ops);
+        $r['insertados'] += count($ops);
+    }
+
+    $ops = [];
+    foreach ($sobrantes as $id) {
+        $ops[] = ["DELETE FROM huellas WHERE cve_huella = ?", [$id]];
+    }
+    aplicarEnLotes($local, $ops);
+    $r['borrados'] = count($ops);
+
+    return $r;
 }
 
-function notifica_sincronizacion($con,$origen){
-	$existeOrigen = "select count(*) existe from check_activos WHERE nombre_origen = '".$origen."'";
-	$prEx = $con->prepare($existeOrigen);
-	$prEx->execute();
-	$rwEx = $prEx->fetch(PDO::FETCH_ASSOC);
-
-	if($rwEx['existe'] != '0'){
-		$actualizaOrigen = "update check_activos set 
-							fecha_actualizacion_general = now() 
-							where nombre_origen = '".$origen."' ";
-		$prAc = $con->prepare($actualizaOrigen);
-		$prAc->execute();
-	} else {
-		$insertaOrigen = "	insert into check_activos 
-							(nombre_origen,fecha_actualizacion_general) 
-							values ('".$origen."',now())";
-		$prIn = $con->prepare($insertaOrigen);
-		$prIn->execute();
-	}
+/** Devuelve los valores de $fila en el orden de $columnas. */
+function valores(array $fila, array $columnas)
+{
+    $v = [];
+    foreach ($columnas as $c) {
+        $v[] = array_key_exists($c, $fila) ? $fila[$c] : null;
+    }
+    return $v;
 }
 
-$con->commit();
-$conLocal->commit();
+/**
+ * Ejecuta las operaciones en transacciones cortas de TAM_LOTE.
+ * Cada transacción dura milisegundos; si encuentra una fila ocupada espera como
+ * máximo STMT_TIMEOUT, deshace su lote y reintenta después, cediendo el paso al checador.
+ *
+ * Cada operación: [sql, params, indicesBinarios(opcional)]
+ */
+function aplicarEnLotes(PDO $pdo, array $ops)
+{
+    // 55P03 lock_not_available, 40P01 deadlock, 40001 serialization, 57014 statement timeout
+    $reintentables = ['55P03', '40P01', '40001', '57014'];
 
-?>
+    foreach (array_chunk($ops, TAM_LOTE) as $lote) {
+        for ($intento = 1; ; $intento++) {
+            $cache = [];
+            try {
+                $pdo->beginTransaction();
+                $pdo->exec("SET LOCAL statement_timeout = '" . STMT_TIMEOUT . "'");
 
+                foreach ($lote as $op) {
+                    $sql    = $op[0];
+                    $params = array_values($op[1]);
+                    $lobs   = isset($op[2]) ? $op[2] : [];
 
+                    if (!isset($cache[$sql])) {
+                        $cache[$sql] = $pdo->prepare($sql);
+                    }
+                    $st = $cache[$sql];
 
+                    foreach ($params as $i => $v) {
+                        if ($v === null) {
+                            $st->bindValue($i + 1, null, PDO::PARAM_NULL);
+                        } elseif (in_array($i, $lobs, true)) {
+                            $st->bindValue($i + 1, $v, PDO::PARAM_LOB);
+                        } else {
+                            $st->bindValue($i + 1, (string)$v, PDO::PARAM_STR);
+                        }
+                    }
+                    $st->execute();
+                }
 
+                $pdo->commit();
+                break;
+            } catch (PDOException $e) {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+                if (!in_array($e->getCode(), $reintentables, true) || $intento >= MAX_REINTENTOS) {
+                    throw $e;
+                }
+                usleep(500000 * $intento); // 0.5s, 1s... deja pasar a quien esté checando
+            }
+        }
+    }
+}
+
+/** Marca en el servidor central la fecha de la última sincronización de este checador. */
+function notificaSincronizacion(PDO $con, $origen)
+{
+    $up = $con->prepare("UPDATE check_activos SET fecha_actualizacion_general = now() WHERE nombre_origen = ?");
+    $up->execute([$origen]);
+    if ($up->rowCount() === 0) {
+        $con->prepare("INSERT INTO check_activos (nombre_origen, fecha_actualizacion_general) VALUES (?, now())")
+            ->execute([$origen]);
+    }
+}
