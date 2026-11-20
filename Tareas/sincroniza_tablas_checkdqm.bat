@@ -1,1 +1,0 @@
-php C:\Tareas\ctrl_sincroniza_tablas_loc.php
